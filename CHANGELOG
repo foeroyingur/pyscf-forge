@@ -1,3 +1,12 @@
+PySCF-Forge (unreleased)
+------------------------
+* New features
+  - Polarizable and electrostatic embedding through an interface to PyFraME
+    (0.5 or newer), for SCF, DFT, post-SCF, CASCI/CASSCF and TDSCF, with
+    analytic SCF nuclear gradients and electrostatic embedding Hessians. The
+    potential is a PyFraME JSON file or a PyFraME system built in memory.
+
+
 PySCF-Forge 1.1.1 (2026-03-15)
 ------------------------------
 * Fixes

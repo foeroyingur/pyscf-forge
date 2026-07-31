@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-# Copyright 2019-2020 The PySCF Developers. All Rights Reserved.
+# Copyright 2026 The PySCF Developers. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,49 +14,189 @@
 # limitations under the License.
 
 '''
-Interface to PyFraME
+Polarizable and electrostatic embedding through an interface to PyFraME.
 
+PolarizableEmbedding describes the environment by the multipoles of its sites
+together with the dipoles they induce in the field of the quantum region;
+ElectrostaticEmbedding keeps the multipoles and drops the induction, i.e. the
+environment does not respond to the density.
+
+TODO: fill in before merging.
 GitHub:      XXX
 Code:        Zenodo.XXX
 Publication: XXX
 '''
 
+from __future__ import annotations
+
+import copy
+import os
+import warnings
+
 import numpy as np
 
 try:
-    import pyframe
-except ImportError:
+    from pyframe.embedding import (read_input, electrostatic_interactions, induction_interactions,
+                                   repulsion_interactions, dispersion_interactions)
+except ImportError as err:
     raise ImportError(
-        'Unable to import PyFraME. Please install PyFraME.')
+        'Unable to import PyFraME. Please install PyFraME.') from err
 
-from pyframe.embedding import (read_input, electrostatic_interactions, induction_interactions, repulsion_interactions,
-                               dispersion_interactions)
+from pyframe.embedding.integral_driver_template import IntegralDriverTemplate
+from pyframe.embedding.subsystem import QuantumSubsystem
 
+# with_nuclei is the newest PyFraME API used here. Without it the first model
+# built would fail deep inside _sync_quantum_subsystem, so say so up front.
+if not hasattr(QuantumSubsystem, 'with_nuclei'):
+    raise ImportError(
+        'The installed PyFraME is too old for pyscf.embedding: its '
+        'QuantumSubsystem has no with_nuclei, which PyFraME has from 0.5a0.dev1 '
+        'on. That version is a tag rather than a PyPI release, so install it with '
+        'pip install git+https://gitlab.com/pyframe-project/pyframe.git@0.5a0.dev1')
+
+from pyscf import __config__
 from pyscf import lib
 from pyscf.lib import logger
 from pyscf import gto
 from pyscf import df
+from pyscf.data.elements import _std_symbol_without_ghost
 from pyscf.embedding import _attach_embedding
 
 
 @lib.with_doc(_attach_embedding._for_scf.__doc__)
-def embedding_for_scf(mf, solvent_obj):
-    if not isinstance(solvent_obj, PolarizableEmbedding):
-        solvent_obj = PolarizableEmbedding(mf.mol, solvent_obj)
-    return _attach_embedding._for_scf(mf, solvent_obj)
+def embedding_for_scf(mf, solvent_obj, dm=None, cls=None):
+    if cls is None:
+        cls = PolarizableEmbedding
+    if not isinstance(solvent_obj, EmbeddingBase):
+        solvent_obj = cls(mf.mol, solvent_obj)
+    return _attach_embedding._for_scf(mf, solvent_obj, dm)
 
 
-class EmbeddingIntegralDriver:
+@lib.with_doc(_attach_embedding._for_post_scf.__doc__)
+def embedding_for_post_scf(method, solvent_obj, dm=None, cls=None):
+    if cls is None:
+        cls = PolarizableEmbedding
+    if not isinstance(solvent_obj, EmbeddingBase):
+        solvent_obj = cls(method.mol, solvent_obj)
+    return _attach_embedding._for_post_scf(method, solvent_obj, dm)
+
+
+@lib.with_doc(_attach_embedding._for_tdscf.__doc__)
+def embedding_for_tdscf(method, solvent_obj=None, dm=None, cls=None,
+                        equilibrium_solvation=False):
+    if solvent_obj is not None and not isinstance(solvent_obj, EmbeddingBase):
+        if cls is None:
+            cls = PolarizableEmbedding
+        solvent_obj = cls(method.mol, solvent_obj)
+    return _attach_embedding._for_tdscf(method, solvent_obj, dm,
+                                        equilibrium_solvation)
+
+
+@lib.with_doc(_attach_embedding._for_casci.__doc__)
+def embedding_for_casci(mc, solvent_obj, dm=None, cls=None):
+    if cls is None:
+        cls = PolarizableEmbedding
+    if not isinstance(solvent_obj, EmbeddingBase):
+        solvent_obj = cls(mc.mol, solvent_obj)
+    return _attach_embedding._for_casci(mc, solvent_obj, dm)
+
+
+@lib.with_doc(_attach_embedding._for_casscf.__doc__)
+def embedding_for_casscf(mc, solvent_obj, dm=None, cls=None):
+    if cls is None:
+        cls = PolarizableEmbedding
+    if not isinstance(solvent_obj, EmbeddingBase):
+        solvent_obj = cls(mc.mol, solvent_obj)
+    return _attach_embedding._for_casscf(mc, solvent_obj, dm)
+
+
+def _is_potential(obj):
+    '''Whether obj is a potential given in memory rather than a file: a
+    PyFraME system (MolecularSystem or Snapshot), which builds its subsystems
+    with to_subsystems, or the Subsystems either of them returns.'''
+    return (isinstance(obj, read_input.Subsystems)
+            or (not isinstance(obj, dict) and hasattr(obj, 'to_subsystems')))
+
+
+# Fraction of max_memory the integral drivers may retain as cached three-index
+# integrals. The rest is left for the SCF itself and for the block being built.
+CACHE_FRACTION = getattr(__config__, 'embedding_cache_fraction', 0.4)
+
+
+def _blocked_range(mol, nsites, nbytes_per_site, max_memory, description):
+    '''Block a site loop so that one block of integrals fits in memory.
+
+    Returns the block size. Raises when not even a single site fits, which is
+    far more useful than the MemoryError that would otherwise come out of the
+    integral build.
+    '''
+    available = max_memory - lib.current_memory()[0]
+    blksize = int(available * 1e6 / nbytes_per_site)
+    if blksize < 1:
+        raise MemoryError(
+            'Not enough memory for the %s of a single site: %.0f MB required, '
+            '%.0f MB of the %.0f MB budget available. Raise mol.max_memory, or '
+            'reduce the basis set or the size of the embedding potential.'
+            % (description, nbytes_per_site / 1e6, available, max_memory))
+    return min(nsites, blksize)
+
+
+class EmbeddingIntegralDriver(IntegralDriverTemplate):
+    # Subclassed for the check it buys: the template's three abstract methods
+    # are the ones an energy needs, so a rename on PyFraME's side stops the
+    # driver being made rather than surfacing mid-SCF. The gradient and Hessian
+    # drivers of this package are not shaped like the template and do not
+    # subclass it.
 
     def __init__(self, molecule):
         self.mol = molecule
-        self.coordinates0 = None
-        self.coordinates1 = None
-        self.coordinates2 = None
-        self.integral0 = None
-        self.integral1 = None
-        self.integral2_1 = None
-        self.integral2_2 = None
+        self.max_memory = molecule.max_memory
+        # Three-index integrals, keyed by (intor, coordinates). The methods
+        # below evaluate the same intor at different sets of sites -- all
+        # classical sites, the sites carrying dipoles, the polarizable sites --
+        # so one slot per intor would be invalidated on every call and the
+        # integrals would be rebuilt several times per SCF iteration.
+        self._integrals = {}
+        self._cached_bytes = 0
+
+    def _aux_e2_blocks(self, intor, coordinates, comp):
+        '''Yield (p0, p1, integrals) over blocks of sites.
+
+        The whole array is built once and cached when it fits the cache budget,
+        in which case a single block spanning every site is yielded. Otherwise
+        the integrals are rebuilt in blocks on each call and nothing is cached,
+        which keeps the peak memory bounded at the cost of the recomputation.
+
+        The cache is keyed on (intor, coordinates) only: the integrals also
+        depend on self.mol, but that is fixed for the lifetime of the driver --
+        a new driver is created whenever the molecule changes.
+        '''
+        coordinates = np.asarray(coordinates)
+        nsites = len(coordinates)
+        key = (intor, coordinates.shape, coordinates.tobytes())
+        integrals = self._integrals.get(key)
+        if integrals is not None:
+            yield 0, nsites, integrals
+            return
+
+        nao = self.mol.nao
+        nbytes_per_site = comp * nao * nao * 8
+        cache_budget = self.max_memory * CACHE_FRACTION * 1e6
+        if self._cached_bytes + nsites * nbytes_per_site <= cache_budget:
+            integrals = self._build(intor, coordinates)
+            self._integrals[key] = integrals
+            self._cached_bytes += integrals.nbytes
+            yield 0, nsites, integrals
+            return
+
+        blksize = _blocked_range(self.mol, nsites, nbytes_per_site,
+                                 self.max_memory, '%s integrals' % intor)
+        for p0, p1 in lib.prange(0, nsites, blksize):
+            yield p0, p1, self._build(intor, coordinates[p0:p1])
+
+    def _build(self, intor, coordinates):
+        fakemol = gto.fakemol_for_charges(coordinates)
+        return df.incore.aux_e2(self.mol, fakemol, intor=intor)
 
     def electronic_fields(self,
                           coordinates: np.ndarray,
@@ -73,13 +213,17 @@ class EmbeddingIntegralDriver:
 
         Returns:
             Electronic fields. Shape: (number of atoms, 3) Dtype: np.float64.
+
+        Note:
+            The electric field of the electrons, E = -grad phi with the
+            electron charge included, as PyFraME's IntegralDriverTemplate
+            defines it; PyFraME takes it as it is.
         """
-        if self.coordinates1 is None or not np.array_equal(self.coordinates1, coordinates):
-            self.coordinates1 = coordinates
-            fakemol = gto.fakemol_for_charges(self.coordinates1)
-            self.integral1 = df.incore.aux_e2(self.mol, fakemol, intor='int3c2e_ip1')
-        return -1 * (np.einsum('aijg,ij->ga', self.integral1, density_matrix)
-                     + np.einsum('aijg,ji->ga', self.integral1, density_matrix))
+        fields = np.empty((len(coordinates), 3))
+        for p0, p1, integrals in self._aux_e2_blocks('int3c2e_ip1', coordinates, comp=3):
+            fields[p0:p1] = (np.einsum('aijg,ij->ga', integrals, density_matrix)
+                             + np.einsum('aijg,ji->ga', integrals, density_matrix))
+        return fields
 
     def multipole_potential_integrals(self,
                                       multipole_coordinates: np.ndarray,
@@ -110,43 +254,34 @@ class EmbeddingIntegralDriver:
         # 0 order
         idx = np.where(multipole_orders >= 0)[0]
         charge_coordinates = multipole_coordinates[idx]
-        if self.coordinates0 is None or not np.array_equal(self.coordinates0, charge_coordinates):
-            self.coordinates0 = charge_coordinates
-            fakemol = gto.fakemol_for_charges(charge_coordinates)
-            self.integral0 = df.incore.aux_e2(self.mol, fakemol, intor='int3c2e')
-        # shouldnt multipoles also use [idx]?
-        charges = np.array([m[0:1] for m in multipoles])
-        op += np.einsum('ijg,ga->ij', self.integral0 * -1.0, charges)
+        charges = np.array([multipoles[i][0:1] for i in idx])
+        for p0, p1, integrals in self._aux_e2_blocks('int3c2e', charge_coordinates, comp=1):
+            op -= np.einsum('ijg,ga->ij', integrals, charges[p0:p1])
         # 1 order
         if np.any(multipole_orders >= 1):
             idx = np.where(multipole_orders >= 1)[0]
             dipole_coordinates = multipole_coordinates[idx]
-            if self.coordinates1 is None or not np.array_equal(self.coordinates1, dipole_coordinates):
-                self.coordinates1 = dipole_coordinates
-                fakemol = gto.fakemol_for_charges(self.coordinates1)
-                self.integral1 = df.incore.aux_e2(self.mol, fakemol, intor='int3c2e_ip1')
-            integral1 = self.integral1
             dipoles = np.array([multipoles[i][1:4] for i in idx])
-            v = np.einsum('aijg,ga->ij', integral1, dipoles)
+            v = 0
+            for p0, p1, integrals in self._aux_e2_blocks('int3c2e_ip1', dipole_coordinates, comp=3):
+                v = v + np.einsum('aijg,ga->ij', integrals, dipoles[p0:p1])
             op += v + v.T
         # 2 order
         if np.any(multipole_orders >= 2):
             idx = np.where(multipole_orders >= 2)[0]
             quadrupol_coordinates = multipole_coordinates[idx]
-            if self.coordinates2 is None or not np.array_equal(self.coordinates0, quadrupol_coordinates):
-                self.coordinates2 = quadrupol_coordinates
-                fakemol = gto.fakemol_for_charges(quadrupol_coordinates)
-                self.integral2_1 = df.incore.aux_e2(self.mol, fakemol, intor='int3c2e_ipip1')
-                self.integral2_2 = df.incore.aux_e2(self.mol, fakemol, intor='int3c2e_ipvip1')
             n_sites = idx.size
             quadrupoles_non_symmetrized = np.array([multipoles[i][4:10] for i in idx])
             quadrupoles = np.zeros((n_sites, 9))
             quadrupoles[:, [0, 1, 2, 4, 5, 8]] = quadrupoles_non_symmetrized
             quadrupoles[:, [0, 3, 6, 4, 7, 8]] += quadrupoles_non_symmetrized
             quadrupoles *= -0.5
-            v = np.einsum('aijg,ga->ij', self.integral2_1, quadrupoles)
+            v = 0
+            for p0, p1, integrals in self._aux_e2_blocks('int3c2e_ipip1', quadrupol_coordinates, comp=9):
+                v = v + np.einsum('aijg,ga->ij', integrals, quadrupoles[p0:p1])
             op += v + v.T
-            op += np.einsum('aijg,ga->ij', self.integral2_2, quadrupoles) * 2
+            for p0, p1, integrals in self._aux_e2_blocks('int3c2e_ipvip1', quadrupol_coordinates, comp=9):
+                op += np.einsum('aijg,ga->ij', integrals, quadrupoles[p0:p1]) * 2
         return op
 
     def induced_dipoles_potential_integrals(self,
@@ -167,61 +302,421 @@ class EmbeddingIntegralDriver:
                 Shape: (number of ao functions, number of ao functions)
                 Dtype: np.float64
         """
-        if self.coordinates1 is None or not np.array_equal(self.coordinates1, coordinates):
-            self.coordinates1 = coordinates
-            fakemol = gto.fakemol_for_charges(self.coordinates1)
-            self.integral1 = df.incore.aux_e2(self.mol, fakemol, intor='int3c2e_ip1')
-        f_el_ind = np.einsum('aijg,ga->ij', -1 * self.integral1, induced_dipoles)
+        f_el_ind = 0
+        for p0, p1, integrals in self._aux_e2_blocks('int3c2e_ip1', coordinates, comp=3):
+            f_el_ind = f_el_ind - np.einsum('aijg,ga->ij', integrals, induced_dipoles[p0:p1])
         return f_el_ind + f_el_ind.T
 
 
-class PolarizableEmbedding(lib.StreamObject):
-    _keys = {'mol', 'comm', 'options', 'classical_subsystem', 'quantum_subsystem', 'e', 'v'}
+class EmbeddingBase(lib.StreamObject):
+    '''A molecular mechanics (MM) embedding potential attached to a molecule.
 
-    def __init__(self, molecule, options_or_json_file):
+    Everything a model is built from and nothing a model is: the options, the
+    MM subsystems and the geometry they are kept in step with, the integral
+    driver, the van der Waals interaction with the environment that any model
+    may ask for, and the bookkeeping that kernel and the energy report run on.
+    What the environment does to the density is left to the subclasses -- here
+    it does nothing -- so this class is not a model and is not meant to be
+    instantiated on its own.
+
+    A model is built from a molecule and either the potential itself or a
+    dictionary of options:
+
+    potential
+        the potential: the path of a PyFraME JSON file or the JSON document as
+        a dictionary, a PyFraME MolecularSystem or Snapshot whose embedding
+        potential has been created, or the Subsystems of one. Its quantum
+        subsystem has to be the molecule, link and capping atoms included.
+    vdw
+        {"method": "LJ", "combination_rule": "Lorentz-Berthelot"}, to include
+        the Lennard-Jones repulsion and dispersion; see _parse_options
+    environment_energy
+        whether the internal energy of the environment is reported (True)
+    induced_dipoles
+        PolarizableEmbedding only: "threshold", "max_iterations" and "solver"
+        of the induced dipoles
+
+    A model is written as the terms it adds, each method calling up to its
+    parent so that the terms accumulate:
+
+    _compute_static_contributions
+        whatever the model can evaluate without a density matrix
+    _density_dependent_contributions
+        the energy and the Fock matrix contribution of the model, for a density
+        matrix, added to those of the parent
+    _energy_terms
+        the labelled energies of the model, for reporting
+    '''
+
+    _keys = {'mol', 'comm', 'options', 'classical_subsystem', 'quantum_subsystem',
+             'e', 'v', 'vdw_method', 'vdw_combination_rule',
+             'equilibrium_solvation', 'frozen', 'max_cycle', 'conv_tol',
+             'state_id', 'simulation_box'}
+
+    # Whether the polarizabilities of the potential are used, i.e. whether the
+    # induced dipoles are solved for. Read by the gradient as well, which skips
+    # the induction terms of the gradient when they are not.
+    with_induction = False
+
+    # Recognized keys of the options dictionary. Unknown keys are rejected so
+    # that a typo does not silently disable a requested contribution. A model
+    # that takes options of its own extends the set. See _read_subsystems for
+    # what the potential may be.
+    _valid_option_keys = {'potential', 'vdw', 'environment_energy'}
+    _valid_vdw_keys = {'method', 'combination_rule'}
+
+    def __init__(self, molecule, options_or_potential):
         self.stdout = molecule.stdout
         self.verbose = molecule.verbose
-        # communicator?
+        # PyFraME distributes the environment over an MPI communicator when it
+        # is given one. This interface always runs the environment serially.
         self.comm = None
-        # e (the electrostatic, induction energy, repulsion energy, and dispersion energy.)
-        # and v (the additional potential) are
+        # e (the embedding energy) and v (the additional potential) are
         # updated during the SCF iterations
         self.e = None
         self.v = None
+        # the environment's own energy at the density the potential belongs to,
+        # which is e itself unless the model is frozen
+        self._e_frozen = None
+        # the density matrix e and v were last computed for
         self._dm = None
-        self._e_ind = None
-        self._e_es = None
         self.vdw_method = None
         self.vdw_combination_rule = None
+        # The macro iteration that relaxes the environment against a correlated
+        # density runs to these; see PostSCFWithEmbedding.kernel. They are not
+        # the SCF's own thresholds -- the environment converges alongside it,
+        # not within it.
+        self.max_cycle = 20
+        self.conv_tol = 1e-7
+        # Which state the environment is polarized by, when the method solves
+        # for several. The environment sees one density, so a multi-root CASCI
+        # has to say which.
+        self.state_id = 0
+        # Whether the potential is held at the density it was last computed
+        # for instead of following the density. kernel stops re-solving, and
+        # the environment becomes a fixed external term; see _for_scf's dm
+        # argument, which is the usual way to set it.
+        self.frozen = False
+        # Whether the environment is taken to relax against a first-order
+        # density, which is what gen_response asks before adding _B_dot_x. A
+        # ground-state orbital Hessian wants it; a vertical excitation does
+        # not, the environment being slow next to the electrons, so the default
+        # is the non-equilibrium one, as in pyscf.solvent. The name is
+        # solvent's, kept so that the two read alike.
+        self.equilibrium_solvation = False
+
+        # The simulation box of the potential, in angstrom, or None where it
+        # carries none. Kept for reference only: the environment is treated as
+        # a cluster, with no minimum image convention.
+        self.simulation_box = None
 
         self.mol = molecule
         self.max_memory = molecule.max_memory
-        if isinstance(options_or_json_file, str):
-            self.options = {"json_file": options_or_json_file}
-        else:
-            self.options = options_or_json_file
-        if not isinstance(self.options, dict):
-            raise TypeError("Options should be a dictionary.")
-        self._create_pyframe_objects()
+        self._set_options(options_or_potential)
+        self._create_mm_subsystems()
         self._integral_driver = EmbeddingIntegralDriver(molecule=self.mol)
-        self._f_el_es = electrostatic_interactions.es_fock_matrix_contributions(
-            classical_subsystem=self.classical_subsystem,
-            integral_driver=self._integral_driver)
-        self._e_nuc_es = electrostatic_interactions.compute_electrostatic_nuclear_energy(
-            quantum_subsystem=self.quantum_subsystem,
-            classical_subsystem=self.classical_subsystem)
+        self._compute_static_contributions()
+        self._static_contributions_stale = False
 
+    def dump_flags(self, verbose=None):
+        logger.info(self, '******** %s flags ********', self.__class__)
+        logger.info(self, 'frozen = %s', self.frozen)
+        logger.info(self, 'max_cycle = %s', self.max_cycle)
+        logger.info(self, 'conv_tol = %s', self.conv_tol)
+        logger.info(self, 'state_id = %s', self.state_id)
+        logger.info(self, 'equilibrium_solvation = %s', self.equilibrium_solvation)
+        for key, value in self.options.items():
+            if key == 'potential':
+                # a potential held in memory is described rather than printed
+                value = self._describe_potential()
+            logger.info(self, "mm.%s = %s", key, value)
+        return self
+
+    def reset(self, mol=None, options_or_potential=None):
+        '''Reset mol and clean up relevant attributes for scanner mode'''
+        if mol is not None:
+            self.mol = mol
+        if options_or_potential is not None:
+            # A different potential was given, so the MM subsystems have to be
+            # built from it.
+            self._set_options(options_or_potential)
+            self._create_mm_subsystems()
+        else:
+            # The potential is unchanged and the classical subsystem is fixed;
+            # only the geometry of the quantum subsystem follows the Mole
+            # object. Re-reading the potential file would rebuild identical
+            # objects, which dominates the cost of a geometry optimization step
+            # once the potential is of a realistic size.
+            self._sync_quantum_subsystem()
+        # the integrals of the driver are those of the previous geometry
+        self._integral_driver = EmbeddingIntegralDriver(molecule=self.mol)
+        # The static contributions belong to the previous geometry. They are
+        # rebuilt on the next kernel rather than here, so that a reset costs
+        # nothing until the object is used again.
+        self._static_contributions_stale = True
+        self._e_rep = None
+        self._e_disp = None
+        if not self.frozen:
+            self._dm = None
+        # else: the density the potential is frozen at is not a property of the
+        # geometry, so it survives the reset and the next kernel rebuilds the
+        # potential from it -- frozen means the environment does not follow the
+        # density, not that it does not follow the nuclei.
+        self.e = None
+        self.v = None
+        self._e_frozen = None
+        return self
+
+    def kernel(self, dm):
+        '''Embedding energy and Fock matrix contribution for a density matrix.
+
+        Args:
+            dm : the density matrix, either closed-shell or a pair of spin
+                blocks, which is traced over spin.
+
+        Returns:
+            (e, v), the embedding energy and the potential to be added to the
+            Fock matrix. Both are also stored on the object.
+
+        What a frozen model holds fixed is the potential, not the energy. The
+        potential is the one belonging to the density it was frozen at; the
+        energy is still that of the density it is handed, which for a frozen
+        model means the environment's own energy plus the interaction of the
+        difference between the two densities with the potential. See
+        _frozen_energy.
+        '''
+        if not (isinstance(dm, np.ndarray) and dm.ndim == 2):
+            # spin-traced DM for UHF or ROHF
+            dm = dm[0] + dm[1]
+        dm = np.asarray(dm)
+
+        if self.frozen:
+            if self._dm is None:
+                raise RuntimeError(
+                    'The embedding is frozen but holds no density matrix to '
+                    'freeze the potential at. Pass dm when attaching the '
+                    'embedding to a method, or run kernel once before setting '
+                    'frozen.')
+            if self.v is None:
+                # A reset cleared the potential but kept the density it is
+                # frozen at; rebuild it for the geometry the object now carries.
+                self._e_frozen, self.v = self._contributions(self._dm)
+            self.e = self._frozen_energy(dm)
+            return self.e, self.v
+
+        # Recorded so that the gradient can tell whether the induced dipoles
+        # held by the classical subsystem belong to the density matrix it was
+        # handed, and so that freezing has a density to freeze at.
+        self._dm = dm.copy()
+        self.e, self.v = self._contributions(dm)
+        self._e_frozen = self.e
+        return self.e, self.v
+
+    def _frozen_energy(self, dm):
+        '''The embedding energy of dm in the potential frozen at another density.
+
+        A frozen potential is an external one-electron term, so the functional
+        the SCF minimizes carries Tr(D v) where the environment's own energy
+        carries Tr(D0 v). Reporting the latter for a density that is not D0
+        would be reporting an energy the calculation does not make stationary,
+        and its gradient would need the response of the orbitals to a nuclear
+        displacement -- on this system that missing term is 2 percent of the
+        gradient. `pyscf.solvent` reports it anyway; the difference between the
+        two is the term added here, and it vanishes at D = D0.
+        '''
+        return self._e_frozen + np.einsum('ij,ij->', self.v, dm - self._dm)
+
+    def _contributions(self, density_matrix):
+        '''The embedding energy and potential of a density, from scratch.'''
+        if self._static_contributions_stale:
+            self._compute_static_contributions()
+            self._static_contributions_stale = False
+        e, v = self._density_dependent_contributions(density_matrix)
+        return e + self._e_rep + self._e_disp, v
+
+    def _density_dependent_contributions(self, density_matrix):
+        '''The energy and Fock matrix contribution of the model.
+
+        Returns:
+            (e, v), summed with those of the parent class by every model that
+            adds a term. An environment that only carries Lennard-Jones sites
+            contributes neither, which is what this class describes.
+        '''
+        return 0.0, 0.0
+
+    def _B_dot_x(self, dm):
+        '''The response of the environment to a trial density matrix.
+
+        The change in the embedding potential caused by a first-order density
+        dm, i.e. the environment block of the orbital Hessian applied to a trial
+        vector. Only the field of the electrons enters: the nuclei and the
+        permanent multipoles of the environment are part of the zeroth-order
+        problem and do not respond.
+
+        Args:
+            dm : one density matrix or a stack of them, of any leading shape.
+
+        Returns:
+            The potential, shaped like dm.
+
+        An environment that cannot respond -- one without induced dipoles --
+        contributes exactly zero here, which is the answer rather than a stub,
+        so this is the implementation for every model that is not polarizable.
+        '''
+        return np.zeros_like(np.asarray(dm))
+
+    def nuc_grad_method(self, grad_method):
+        from pyscf.embedding import embedding_gradient
+        return embedding_gradient.make_grad_object(grad_method)
+
+    def hess_method(self, hess_method):
+        from pyscf.embedding import embedding_hessian
+        return embedding_hessian.make_hess_object(hess_method)
+
+    def energy_contributions(self):
+        '''The embedding energy broken down by contribution, for reporting.
+
+        Only the entries that sum to self.e are part of the total energy. The
+        internal energy of the environment is reported alongside them when the
+        environment_energy option is set, but it is a constant offset that no
+        term of the total energy depends on, so it is labelled as excluded.
+        '''
+        contributions = dict(self._energy_terms())
+        if self.vdw_method is not None:
+            contributions['Repulsion contribution      (E_rep) '] = self._e_rep
+            contributions['Dispersion contribution     (E_disp)'] = self._e_disp
+        if self._environment_energy:
+            contributions['Environment energy (not in E_tot)   '] = \
+                self.environment_energy()
+        return contributions
+
+    def _energy_terms(self):
+        '''The labelled energy terms of the model, in reporting order.
+
+        The van der Waals and environment terms are those of the potential
+        rather than of the model, and are appended by energy_contributions.
+        '''
+        return []
+
+    def environment_energy(self):
+        '''Internal interaction energy of the environment.
+
+        A property of the potential rather than of the model: the sites interact
+        among themselves through their multipoles whichever way they are coupled
+        to the quantum region. It is a constant for a fixed environment and is
+        not part of the total energy that kernel returns; see
+        energy_contributions.
+
+        The repulsion and dispersion interactions within the environment are
+        only included when van der Waals interactions were requested, since
+        the Lennard-Jones parameters are otherwise not part of the embedding
+        potential.
+        '''
+        if self.vdw_method is not None:
+            return self.classical_subsystem.environment_energy(
+                vdw_method=self.vdw_method,
+                vdw_combination_rule=self.vdw_combination_rule)
+        return self.classical_subsystem.compute_electrostatic_energy()
+
+    def _set_options(self, options_or_potential):
+        if (isinstance(options_or_potential, (str, os.PathLike))
+                or _is_potential(options_or_potential)):
+            self.options = {'potential': options_or_potential}
+        else:
+            self.options = options_or_potential
+        if not isinstance(self.options, dict):
+            raise TypeError(
+                'Options should be a dictionary, or the potential itself: the '
+                'path of a PyFraME JSON file, a PyFraME system or Subsystems.')
+        self._check_option_keys(self.options, self._valid_option_keys, 'options')
+        if 'potential' not in self.options:
+            raise ValueError(
+                'The options dictionary must contain the key "potential", '
+                'giving the MM potential of the embedding.')
+        self._parse_options()
+
+    @property
+    def potential(self):
+        '''The potential as it was given.'''
+        return self.options['potential']
+
+    def _read_subsystems(self):
+        '''Build the subsystems of the potential, whatever form it was given in.
+
+        The potential is one of
+            - the path of a PyFraME JSON file, or the JSON document itself as a
+              dictionary (pyframe.writers.potential_document), read by PyFraME's
+              reader;
+            - a PyFraME MolecularSystem or Snapshot whose embedding potential
+              has been created, built in memory with its to_subsystems;
+            - a pyframe.embedding.read_input.Subsystems, as either of the above
+              returns, which is copied: the model writes into its subsystems
+              (the geometry, the nuclear charges and the induced dipoles), and
+              one Subsystems may be handed to several models.
+        '''
+        potential = self.potential
+        if isinstance(potential, os.PathLike):
+            potential = os.fspath(potential)
+        if isinstance(potential, (str, dict)):
+            return read_input.reader(input_data=potential, comm=self.comm)
+        if isinstance(potential, read_input.Subsystems):
+            return copy.deepcopy(potential)
+        if hasattr(potential, 'to_subsystems'):
+            return potential.to_subsystems(comm=self.comm)
+        raise TypeError(
+            'The potential should be the path of a PyFraME JSON file, a JSON '
+            'document, a PyFraME system or Subsystems, not %s.'
+            % type(potential).__name__)
+
+    def _describe_potential(self):
+        '''The potential, named for a message.'''
+        potential = self.potential
+        if isinstance(potential, (str, os.PathLike)):
+            return os.fspath(potential)
+        if isinstance(potential, dict):
+            return 'a PyFraME JSON document'
+        return 'a PyFraME %s' % type(potential).__name__
+
+    @staticmethod
+    def _check_option_keys(options, valid_keys, name):
+        unknown = set(options).difference(valid_keys)
+        if unknown:
+            raise ValueError('Unknown %s: %s. Valid keys are: %s.'
+                             % (name, ', '.join(sorted(map(str, unknown))),
+                                ', '.join(sorted(valid_keys))))
+
+    def _parse_options(self):
+        '''Read the options dictionary onto the object.
+
+        The "vdw" entry takes a method, of which PyFraME implements "LJ", and
+        the rule that combines the Lennard-Jones parameters of two sites into a
+        pair coefficient. A rule is named "<sigma rule>-<epsilon rule>", i.e.
+        Lorentz or Good-Hope for sigma and Berthelot or Fender-Halsey for
+        epsilon, and defaults to Lorentz-Berthelot. The powers of the potential
+        are not an option here: they are carried by the sites of the potential
+        file, and default to the 12-6 form.
+        '''
         if 'vdw' in self.options:
             if not isinstance(self.options['vdw'], dict):
                 raise TypeError("vdw options should be a dictionary.")
-            if 'method' in self.options['vdw']:
-                self.vdw_method = self.options['vdw']['method']
-            else:
-                self.vdw_method = 'LJ'
-            if 'combination_rule' in self.options['vdw']:
-                self.vdw_combination_rule = self.options['vdw']['combination_rule']
-            else:
-                self.vdw_combination_rule = 'Lorentz-Berthelot'
+            self._check_option_keys(self.options['vdw'], self._valid_vdw_keys,
+                                    'vdw options')
+            self.vdw_method = self.options['vdw'].get('method', 'LJ')
+            self.vdw_combination_rule = self.options['vdw'].get(
+                'combination_rule', 'Lorentz-Berthelot')
+        else:
+            self.vdw_method = None
+            self.vdw_combination_rule = None
+
+        environment_energy = self.options.get('environment_energy', True)
+        if not isinstance(environment_energy, bool):
+            raise TypeError("environment_energy options should be a bool.")
+        self._environment_energy = environment_energy
+
+    def _compute_static_contributions(self):
+        '''Compute the contributions that do not depend on the density matrix.'''
+        if self.vdw_method is not None:
+            self._check_vdw_parameters()
             self._e_rep = repulsion_interactions.compute_repulsion_interactions(
                 quantum_subsystem=self.quantum_subsystem,
                 classical_subsystem=self.classical_subsystem,
@@ -236,122 +731,248 @@ class PolarizableEmbedding(lib.StreamObject):
             self._e_rep = 0.0
             self._e_disp = 0.0
 
-        if 'induced_dipoles' in self.options:
-            if not isinstance(self.options['induced_dipoles'], dict):
-                raise TypeError("induced_dipoles options should be a dictionary.")
-            elif 'threshold' in self.options['induced_dipoles']:
-                self._threshold = self.options['induced_dipoles']['threshold']
-            elif 'max_iterations' in self.options['induced_dipoles']:
-                self._max_iterations = self.options['induced_dipoles']['max_iterations']
-            elif 'solver' in self.options['induced_dipoles']:
-                self._solver = self.options['induced_dipoles']['solver']
-        else:
-            self._threshold = 1e-8
-            self._max_iterations = 100
-            self._solver = 'jacobi'
+    def _check_vdw_parameters(self):
+        '''Check the Lennard-Jones parameters behind the vdw option.
 
-        if 'environment_energy' in self.options:
-            if not isinstance(self.options['environment_energy'], bool):
-                raise TypeError("environment_energy options should be a bool.")
-            self._environment_energy = self.options['environment_energy']
-        else:
-            self._environment_energy = True
+        A site carrying no parameters contributes nothing rather than ending the
+        calculation, so a potential parameterised in part is legitimate -- and
+        usual, since hydrogens and virtual sites often carry none. PyFraME warns
+        about the sites it skipped; those warnings go to the Python warning
+        stream, so they are re-emitted through the PySCF logger here to reach the
+        output file with everything else.
 
-    def dump_flags(self, verbose=None):
-        logger.info(self, '******** %s flags ********', self.__class__)
-        for key in self.options.keys():
-            logger.info(self, "pyframe.%s = %s", key, self.options[key])
-        return self
+        A potential where nothing is parameterised makes the whole vdw
+        contribution identically zero, which is quiet enough to be worth refusing
+        outright: the option was asked for and would do nothing.
+        '''
+        epsilons = {}
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter('always')
+            for side, subsystem in (('quantum', self.quantum_subsystem),
+                                    ('classical', self.classical_subsystem)):
+                for interaction in ('rep', 'disp'):
+                    epsilons[side, interaction] = np.asarray(
+                        getattr(subsystem, '%s_lj' % interaction).epsilon)
+        for warning in caught:
+            logger.warn(self, '%s', warning.message)
 
-    def reset(self, mol=None, options_or_json_file=None):
-        '''Reset mol and clean up relevant attributes for scanner mode'''
-        if mol is not None:
-            self.mol = mol
-        if options_or_json_file is not None:
-            self.options = options_or_json_file
-        self._create_pyframe_objects()
+        # a pair term needs a non-zero epsilon on both sides to survive the
+        # combination rule
+        if not any(epsilons['quantum', interaction].any()
+                   and epsilons['classical', interaction].any()
+                   for interaction in ('rep', 'disp')):
+            raise ValueError(
+                'The "vdw" option was requested, but no site of %s carries '
+                'Lennard-Jones parameters on both the quantum and the classical '
+                'side, so the repulsion and dispersion contributions would both '
+                'be exactly zero. Regenerate the potential with PyFraME including '
+                'the parameters, or drop the "vdw" option.'
+                % (self._describe_potential(),))
+
+    def _create_mm_subsystems(self):
+        '''Read the potential and take the single pair of subsystems from it.'''
+        subsystems = self._read_subsystems()
+        if len(subsystems.quantum_subsystems) != 1:
+            raise ValueError("Exactly one quantum subsystem is required.")
+        if len(subsystems.classical_subsystems) != 1:
+            raise ValueError("Exactly one classical subsystem is required.")
+        self.quantum_subsystem = subsystems.quantum_subsystems[0]
+        self.classical_subsystem = subsystems.classical_subsystems[0]
+        self.simulation_box = subsystems.simulation_box
+        if self.simulation_box is not None:
+            logger.info(self, 'The potential carries a simulation box, which is '
+                        'not used: the environment is treated as a cluster, '
+                        'without the minimum image convention.')
+        self._sync_quantum_subsystem()
+
+    def _sync_quantum_subsystem(self):
+        '''Take the geometry and the nuclear charges of the quantum subsystem
+        from the Mole object.
+
+        The nuclei of the potential describe the system it was made for, while
+        the Mole object is the one that is being computed on, and the one that
+        moves in a scanner or geometry optimization.
+
+        The quantum subsystem is the terminated core region: its atoms followed,
+        fragment by fragment, by the hydrogen link atoms or capping atoms that
+        terminate the bonds the partitioning cut. The molecule has to be that
+        same molecule, atom for atom and in the same order.
+
+        The charges the environment sees are those of the molecule's nuclei as
+        PySCF treats them, i.e. mol.atom_charges(): an atom carrying an ECP
+        interacts with the environment through its effective charge, as its
+        core electrons are not in the density, and a ghost atom not at all. The
+        potential gives every nucleus the full charge of its element, which is
+        right for an all-electron atom and wrong for any other. A capping atom
+        is meant to carry a capping potential (an ECP) in the molecule.
+        '''
+        subsystem = self.quantum_subsystem
+        mol = self.mol
+        if subsystem.num_nuclei != mol.natm:
+            kinds = [getattr(nucleus, 'kind', 'atom') for nucleus in subsystem.nuclei]
+            boundary = ''
+            if 'link' in kinds or 'cap' in kinds:
+                boundary = (' (%d atoms, %d link atoms and %d capping atoms; the '
+                            'molecule is the core region terminated by its link '
+                            'or capping atoms)'
+                            % (kinds.count('atom'), kinds.count('link'),
+                               kinds.count('cap')))
+            raise ValueError(
+                'The quantum subsystem of the potential has %d nuclei%s, while '
+                'the molecule has %d atoms.'
+                % (subsystem.num_nuclei, boundary, mol.natm))
+
+        # compared by element, ghosts included, since the charges themselves
+        # are expected to differ wherever there is an ECP or a ghost atom, and
+        # a nucleus says which element it is whatever charge it carries
+        elements = np.array([
+            gto.charge(_std_symbol_without_ghost(mol.atom_symbol(i)))
+            for i in range(mol.natm)])
+        if not np.array_equal([nucleus.atomic_number for nucleus in subsystem.nuclei], elements):
+            logger.warn(self, 'The elements of the quantum subsystem of the '
+                        'potential differ from those of the molecule.')
+        for i, nucleus in enumerate(subsystem.nuclei):
+            if getattr(nucleus, 'kind', 'atom') == 'cap' and mol.atom_nelec_core(i) == 0:
+                logger.warn(self, 'Atom %d of the molecule is a capping atom of '
+                            'the potential, but carries no ECP.', i)
+        charge = getattr(subsystem, 'charge', None)
+        if charge is not None and charge != mol.charge:
+            logger.warn(self, 'The quantum subsystem of the potential has charge '
+                        '%s, while the molecule has charge %s.', charge, mol.charge)
+
+        # A subsystem cannot be changed, so this is a new one: with_nuclei puts
+        # the geometry and the charges of the Mole on its nuclei, and the arrays
+        # it gathers from them follow, which writing to either used not to do.
+        self.quantum_subsystem = subsystem.with_nuclei(
+            coordinates=mol.atom_coords(),
+            charges=mol.atom_charges().astype(np.float64))
+
+
+class ElectrostaticEmbedding(EmbeddingBase):
+    '''Embedding in the permanent multipoles of a molecular mechanics (MM) potential.
+
+    The sites of the environment interact with the quantum region through their
+    permanent multipoles. The polarizabilities the potential may carry are
+    ignored: no induced dipoles are solved for, so the environment does not
+    respond to the density.
+    '''
+
+    def __init__(self, molecule, options_or_potential):
+        self._e_es = None
         self._f_el_es = None
         self._e_nuc_es = None
-        self._e_rep = None
-        self._e_disp = None
-        self._dm = None
-        self._e_ind = None
+        super().__init__(molecule, options_or_potential)
+
+    def reset(self, mol=None, options_or_potential=None):
+        super().reset(mol, options_or_potential)
         self._e_es = None
-        self.e = None
-        self.v = None
+        self._f_el_es = None
+        self._e_nuc_es = None
         return self
 
-    def kernel(self, dm):
+    def _compute_static_contributions(self):
+        super()._compute_static_contributions()
+        self._f_el_es = electrostatic_interactions.es_fock_matrix_contributions(
+            classical_subsystem=self.classical_subsystem,
+            integral_driver=self._integral_driver)
+        self._e_nuc_es = electrostatic_interactions.compute_electrostatic_nuclear_energy(
+            quantum_subsystem=self.quantum_subsystem,
+            classical_subsystem=self.classical_subsystem)
+
+    def _energy_terms(self):
+        return super()._energy_terms() + [
+            ('Electrostatic contribution  (E_es)  ', self._e_es)]
+
+    def _density_dependent_contributions(self, density_matrix):
+        '''The interaction of the density with the permanent multipoles.'''
+        e, v = super()._density_dependent_contributions(density_matrix)
+        self._e_es = self._e_nuc_es + np.einsum('ij,ij->', self._f_el_es,
+                                                density_matrix)
+        return e + self._e_es, v + self._f_el_es
+
+
+class PolarizableEmbedding(ElectrostaticEmbedding):
+    '''Embedding in the multipoles and induced dipoles of an MM potential.
+
+    The electrostatics of ElectrostaticEmbedding, with the polarizabilities of
+    the MM potential put to use on top of them: the dipoles the quantum region
+    induces in the environment are solved for at every density matrix, so the
+    environment responds and the coupling is self-consistent.
+    '''
+
+    with_induction = True
+
+    # The iterative solution of the induced dipoles is configurable.
+    _valid_option_keys = ElectrostaticEmbedding._valid_option_keys | {'induced_dipoles'}
+    _valid_induced_dipoles_keys = {'threshold', 'max_iterations', 'solver'}
+
+    def __init__(self, molecule, options_or_potential):
+        self._e_ind = None
+        super().__init__(molecule, options_or_potential)
+
+    def reset(self, mol=None, options_or_potential=None):
+        super().reset(mol, options_or_potential)
+        self._e_ind = None
+        return self
+
+    def _parse_options(self):
+        super()._parse_options()
+        induced_dipoles_options = self.options.get('induced_dipoles', {})
+        if not isinstance(induced_dipoles_options, dict):
+            raise TypeError("induced_dipoles options should be a dictionary.")
+        self._check_option_keys(induced_dipoles_options,
+                                self._valid_induced_dipoles_keys,
+                                'induced_dipoles options')
+        self._threshold = induced_dipoles_options.get('threshold', 1e-8)
+        self._max_iterations = induced_dipoles_options.get('max_iterations', 100)
+        self._solver = induced_dipoles_options.get('solver', 'jacobi')
+
+    def _energy_terms(self):
+        return super()._energy_terms() + [
+            ('Induction contribution      (E_ind) ', self._e_ind)]
+
+    def _B_dot_x(self, dm):
+        '''The induced dipoles a trial density gives rise to, as a potential.
+
+        PyFraME's perturbed-dipole solver is the electronic-field-only path
+        wanted here: it induces dipoles with the field it is handed and nothing
+        else -- no permanent multipole fields, no nuclear field -- and it
+        returns them instead of storing them, so the induced dipoles of the
+        density the model was last run on survive the call.
         '''
-        '''
-        if not (isinstance(dm, np.ndarray) and dm.ndim == 2):
-            # spin-traced DM for UHF or ROHF
-            dm = dm[0] + dm[1]
-        self._e_ind, self._e_es, v = self._compute_pe_contributions(density_matrix=dm)
-        self.e = self._e_ind + self._e_es + self._e_disp + self._e_rep
-        self.v = v
-        return self.e, self.v
-
-    def nuc_grad_method(self, grad_method):
-        from pyscf.embedding import embedding_gradient
-        return embedding_gradient.make_grad_object(grad_method)
-
-    def _create_pyframe_objects(self):
-        # should the creation process get a callback and throw back if sth goes wrong?
-        # throw exception if it is not exactly for one qm and one classical subsystem
-        self.quantum_subsystem, self.classical_subsystem = (read_input.reader(
-            input_data=self.options['json_file'],
-            comm=self.comm))
-
-    def _compute_pe_contributions(self, density_matrix):
-        density_matrix = np.asarray(density_matrix)
-        nao = density_matrix.shape[-1]
-        density_matrix = density_matrix.reshape(-1, nao, nao)
-        if self._e_nuc_es is None:
-            self._e_nuc_es = electrostatic_interactions.compute_electrostatic_nuclear_energy(
-                quantum_subsystem=self.quantum_subsystem,
-                classical_subsystem=self.classical_subsystem)
-        if self._f_el_es is None:
-            self._f_el_es = electrostatic_interactions.es_fock_matrix_contributions(
-                classical_subsystem=self.classical_subsystem,
+        dms = np.asarray(dm)
+        dm_shape = dms.shape
+        nao = dm_shape[-1]
+        dms = dms.reshape(-1, nao, nao)
+        coordinates = self.classical_subsystem.coordinates
+        # A perturbed solve keeps nothing on the subsystem, and the dipoles it
+        # returns are this method's own, so there is nothing to clear away.
+        v = []
+        for x in dms:
+            el_fields = self.quantum_subsystem.compute_electronic_fields(
+                coordinates=coordinates, density_matrix=x,
                 integral_driver=self._integral_driver)
-        if self._e_rep is None or self._e_disp is None:
-            if 'vdw' in self.options:
-                if not isinstance(self.options['vdw'], dict):
-                    raise TypeError("vdw options should be a dictionary.")
-                if 'method' in self.options['vdw']:
-                    self.vdw_method = self.options['vdw']['method']
-                else:
-                    self.vdw_method = 'LJ'
-                if 'combination_rule' in self.options['vdw']:
-                    self.vdw_combination_rule = self.options['vdw']['combination_rule']
-                else:
-                    self.vdw_combination_rule = 'Lorentz-Berthelot'
-                self._e_rep = repulsion_interactions.compute_repulsion_interactions(
-                    quantum_subsystem=self.quantum_subsystem,
-                    classical_subsystem=self.classical_subsystem,
-                    method=self.vdw_method,
-                    combination_rule=self.vdw_combination_rule)
-                self._e_disp = dispersion_interactions.compute_dispersion_interactions(
-                    quantum_subsystem=self.quantum_subsystem,
-                    classical_subsystem=self.classical_subsystem,
-                    method=self.vdw_method,
-                    combination_rule=self.vdw_combination_rule)
-            else:
-                self._e_rep = 0.0
-                self._e_disp = 0.0
-        e_el_es = np.einsum('ij,xij->x', self._f_el_es, density_matrix)[0]
+            induced_dipoles = self.classical_subsystem.solve_perturbed_induced_dipoles(
+                external_fields=el_fields, threshold=self._threshold,
+                max_iterations=self._max_iterations, solver=self._solver)
+            v.append(self._integral_driver.induced_dipoles_potential_integrals(
+                induced_dipoles=induced_dipoles, coordinates=coordinates))
+        return np.asarray(v).reshape(dm_shape)
+
+    def _density_dependent_contributions(self, density_matrix):
+        '''Solve for the induced dipoles and take their energy and potential.'''
+        e, v = super()._density_dependent_contributions(density_matrix)
         el_fields = self.quantum_subsystem.compute_electronic_fields(coordinates=self.classical_subsystem.coordinates,
-                                                                     density_matrix=density_matrix[0],
+                                                                     density_matrix=density_matrix,
                                                                      integral_driver=self._integral_driver)
         nuc_fields = self.quantum_subsystem.compute_nuclear_fields(self.classical_subsystem.coordinates)
         self.classical_subsystem.solve_induced_dipoles(external_fields=(el_fields + nuc_fields),
                                                        threshold=self._threshold,
                                                        max_iterations=self._max_iterations,
                                                        solver=self._solver)
-        e_ind = induction_interactions.compute_induction_energy(
+        self._e_ind = induction_interactions.compute_induction_energy(
             induced_dipoles=self.classical_subsystem.induced_dipoles.induced_dipoles,
             total_fields=el_fields + nuc_fields + self.classical_subsystem.multipole_fields)
         f_el_ind = induction_interactions.ind_fock_matrix_contributions(classical_subsystem=self.classical_subsystem,
                                                                         integral_driver=self._integral_driver)
-        return e_ind, self._e_nuc_es + e_el_es, self._f_el_es - f_el_ind
+        return e + self._e_ind, v + f_el_ind
