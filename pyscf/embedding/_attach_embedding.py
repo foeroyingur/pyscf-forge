@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-# Copyright 2014-2020 The PySCF Developers. All Rights Reserved.
+# Copyright 2026 The PySCF Developers. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -44,6 +44,21 @@ class SCFWithEmbedding(_Embedding):
         self.__dict__.update(mf.__dict__)
         self.with_embedding = embedding_obj
 
+    def undo_embedding(self):
+        '''Revert to the bare SCF method the embedding was attached to.'''
+        cls = self.__class__
+        name_mixin = self.with_embedding.__class__.__name__
+        obj = lib.view(self, lib.drop_class(cls, SCFWithEmbedding, name_mixin))
+        del obj.with_embedding
+        return obj
+
+    def to_gpu(self):
+        # Without this, the generic conversion would hand back a GPU method
+        # whose embedding potential is silently absent.
+        raise NotImplementedError(
+            'Embedding has no GPU implementation. Call '
+            '.undo_embedding().to_gpu() to move the bare method to the GPU.')
+
     def dump_flags(self, verbose=None):
         super().dump_flags(verbose)
         self.with_embedding.check_sanity()
@@ -56,9 +71,8 @@ class SCFWithEmbedding(_Embedding):
 
     def get_veff(self, mol=None, dm=None, *args, **kwargs):
         vhf = super().get_veff(mol, dm, *args, **kwargs)
-        with_embedding = self.with_embedding
-        with_embedding.e, with_embedding.v = with_embedding.kernel(dm)
-        e_embedding, v_embedding = with_embedding.e, with_embedding.v
+        # kernel stores e and v on the embedding object itself
+        e_embedding, v_embedding = self.with_embedding.kernel(dm)
 
         # NOTE: v_embedding should not be added to vhf in this place. This is
         # because vhf is used as the reference for direct_scf in the next
@@ -67,27 +81,21 @@ class SCFWithEmbedding(_Embedding):
 
     def _finalize(self):
         '''Hook for dumping results and clearing up the object.'''
-        logger.info(self, '\n******** %s Energy Contributions ********', self.with_embedding.
-                    __class__.__name__)
-        logger.info(self, 'Electrostatic Contributions (E_es) = %.15g', self.with_embedding._e_es)
-        logger.info(self, 'Induced Contributions (E_ind) = %.15g', self.with_embedding._e_ind)
-        if 'vdw' in self.with_embedding.options:
-            logger.info(self, 'Repulsion Contributions (E_rep) = %.15g', self.with_embedding._e_rep)
-            logger.info(self, 'Dispersion Contributions (E_disp) = %.15g', self.with_embedding._e_disp)
-        if self.with_embedding._environment_energy:
-            logger.info(self, 'Environment Contributions (E_mul) = %.15g', self.with_embedding.
-                        classical_subsystem.environment_energy)
-        logger.info(self, '\n')
-        if self.converged:
-            logger.note(self, 'converged SCF energy = %.15g', self.e_tot)
-        else:
-            logger.note(self, 'SCF not converged.')
-            logger.note(self, 'SCF energy = %.15g', self.e_tot)
-        return self
+        with_embedding = self.with_embedding
+        if with_embedding.e is not None:
+            logger.info(self, '\n******** %s Energy Contributions ********',
+                        with_embedding.__class__.__name__)
+            for label, energy in with_embedding.energy_contributions().items():
+                logger.info(self, '%s = %.15g', label, energy)
+            logger.info(self, '\n')
+        return super()._finalize()
 
     def get_fock(self, h1e=None, s1e=None, vhf=None, dm=None, cycle=-1,
                  diis=None, diis_start_cycle=None,
                  level_shift_factor=None, damp_factor=None, fock_last=None):
+        if dm is None:
+            dm = self.make_rdm1()
+
         # DIIS was called inside super().get_fock. v_embedding, as a function of
         # dm, should be extrapolated as well. To enable it, v_embedding has to be
         # added to the fock matrix before DIIS was called.

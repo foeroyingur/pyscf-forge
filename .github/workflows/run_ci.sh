@@ -18,5 +18,7 @@ pip install trexio
 pip install mcfun
 pip install --no-deps pyscf-dispersion==1.5.0
 
+pip install git+https://gitlab.com/pyframe-project/pyframe.git@trajectory_embedding
+
 # TODO: check if pyscf code is changed using dist-info file
 #pip uninstall -y pyscf-forge
