@@ -1,3 +1,10 @@
+PySCF-Forge (unreleased)
+------------------------
+* New features
+  - Polarizable embedding (PE) through an interface to PyFraME, for SCF and DFT
+    energies and their analytic nuclear gradients
+
+
 PySCF-Forge 1.1.1 (2026-03-15)
 ------------------------------
 * Fixes
