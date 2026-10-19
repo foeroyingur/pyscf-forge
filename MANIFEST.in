@@ -15,3 +15,6 @@ recursive-include pyscf *.c *.h CMakeLists.txt
 
 # dh xccode JSON data
 recursive-include pyscf/dh *.json
+
+# embedding potentials used by the tests
+recursive-include pyscf/embedding *.json
